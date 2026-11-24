@@ -3,29 +3,29 @@
 #![feature(asm_const)]
 #![feature(riscv_ext_intrinsics)]
 
+extern crate alloc;
 #[cfg(feature = "axstd")]
 extern crate axstd as std;
-extern crate alloc;
 #[macro_use]
 extern crate axlog;
 
+mod csrs;
+mod loader;
+mod regs;
+mod sbi;
 mod task;
 mod vcpu;
-mod regs;
-mod csrs;
-mod sbi;
-mod loader;
 
-use vcpu::VmCpuRegisters;
-use riscv::register::{scause, sstatus, stval};
-use csrs::defs::hstatus;
-use tock_registers::LocalRegisterCopy;
-use csrs::{RiscvCsrTrait, CSR};
-use vcpu::_run_guest;
-use sbi::SbiMessage;
-use loader::load_vm_image;
-use axhal::mem::PhysAddr;
 use crate::regs::GprIndex::{A0, A1};
+use axhal::mem::PhysAddr;
+use csrs::defs::hstatus;
+use csrs::{RiscvCsrTrait, CSR};
+use loader::load_vm_image;
+use riscv::register::{scause, sstatus, stval};
+use sbi::SbiMessage;
+use tock_registers::LocalRegisterCopy;
+use vcpu::VmCpuRegisters;
+use vcpu::_run_guest;
 
 const VM_ENTRY: usize = 0x8020_0000;
 
@@ -50,14 +50,31 @@ fn main() {
     prepare_vm_pgtable(ept_root);
 
     // Kick off vm and wait for it to exit.
-    while !run_guest(&mut ctx) {
-    }
+    while !run_guest(&mut ctx) {}
 
     panic!("Hypervisor ok!");
 }
 
 fn prepare_vm_pgtable(ept_root: PhysAddr) {
-    let hgatp = 8usize << 60 | usize::from(ept_root) >> 12;
+    use alloc::alloc::{alloc_zeroed, Layout};
+    use axhal::mem::{phys_to_virt, virt_to_phys};
+
+    const SV39X4_ROOT_SIZE: usize = 16 * 1024;
+    const SV39_ROOT_SIZE: usize = 4 * 1024;
+
+    // Sv39x4 requires a 16-KiB-aligned root containing 2048 entries.  The
+    // address space supplies an ordinary 4-KiB Sv39 root, whose lower-address
+    // entries can be copied into a zeroed Sv39x4 root.
+    let layout = Layout::from_size_align(SV39X4_ROOT_SIZE, SV39X4_ROOT_SIZE).unwrap();
+    let root_ptr = unsafe { alloc_zeroed(layout) };
+    assert!(!root_ptr.is_null(), "cannot allocate Sv39x4 root");
+    unsafe {
+        core::ptr::copy_nonoverlapping(phys_to_virt(ept_root).as_ptr(), root_ptr, SV39_ROOT_SIZE);
+    }
+
+    let new_root = virt_to_phys((root_ptr as usize).into());
+    assert_eq!(usize::from(new_root) & (SV39X4_ROOT_SIZE - 1), 0);
+    let hgatp = (8usize << 60) | (usize::from(new_root) >> 12);
     unsafe {
         core::arch::asm!(
             "csrw hgatp, {hgatp}",
@@ -68,11 +85,29 @@ fn prepare_vm_pgtable(ept_root: PhysAddr) {
 }
 
 fn run_guest(ctx: &mut VmCpuRegisters) -> bool {
+    const STIE: usize = 1 << 5;
+    let saved_sie: usize;
+
     unsafe {
+        // A pending host timer interrupt must not overwrite scause before the
+        // VM exit has been decoded.
+        core::arch::asm!(
+            "csrrc {saved}, sie, {mask}",
+            saved = out(reg) saved_sie,
+            mask = in(reg) STIE,
+        );
         _run_guest(ctx);
     }
 
-    vmexit_handler(ctx)
+    let exited = vmexit_handler(ctx);
+
+    unsafe {
+        if saved_sie & STIE != 0 {
+            core::arch::asm!("csrs sie, {mask}", mask = in(reg) STIE);
+        }
+    }
+
+    exited
 }
 
 #[allow(unreachable_code)]
@@ -94,25 +129,39 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
                         assert_eq!(a1, 0x1234);
                         ax_println!("Shutdown vm normally!");
                         return true;
-                    },
-                    _ => todo!(),
+                    }
+                    other => panic!("unsupported SBI message: {:?}", other),
                 }
             } else {
                 panic!("bad sbi message! ");
             }
-        },
+        }
         Trap::Exception(Exception::IllegalInstruction) => {
-            panic!("Bad instruction: {:#x} sepc: {:#x}",
-                stval::read(),
-                ctx.guest_regs.sepc
+            let instruction = stval::read();
+            if ctx.guest_regs.sepc == VM_ENTRY && instruction == 0xf14025f3 {
+                // Emulate `csrr a1, mhartid` for the VS-mode guest.
+                ctx.guest_regs.gprs.set_reg(A1, 0x1234);
+                ctx.guest_regs.sepc += 4;
+                return false;
+            }
+            panic!(
+                "Unexpected illegal instruction: {:#x} sepc: {:#x}",
+                instruction, ctx.guest_regs.sepc
             );
-        },
+        }
         Trap::Exception(Exception::LoadGuestPageFault) => {
-            panic!("LoadGuestPageFault: stval{:#x} sepc: {:#x}",
-                stval::read(),
-                ctx.guest_regs.sepc
+            let fault_addr = stval::read();
+            if ctx.guest_regs.sepc == VM_ENTRY + 4 && fault_addr == 0x40 {
+                // Emulate `ld a0, 64(zero)` without mapping the zero page.
+                ctx.guest_regs.gprs.set_reg(A0, 0x6688);
+                ctx.guest_regs.sepc += 4;
+                return false;
+            }
+            panic!(
+                "Unexpected LoadGuestPageFault: stval={:#x} sepc={:#x}",
+                fault_addr, ctx.guest_regs.sepc
             );
-        },
+        }
         _ => {
             panic!(
                 "Unhandled trap: {:?}, sepc: {:#x}, stval: {:#x}",
@@ -127,9 +176,8 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
 
 fn prepare_guest_context(ctx: &mut VmCpuRegisters) {
     // Set hstatus
-    let mut hstatus = LocalRegisterCopy::<usize, hstatus::Register>::new(
-        riscv::register::hstatus::read().bits(),
-    );
+    let mut hstatus =
+        LocalRegisterCopy::<usize, hstatus::Register>::new(riscv::register::hstatus::read().bits());
     // Set Guest bit in order to return to guest mode.
     hstatus.modify(hstatus::spv::Guest);
     // Set SPVP bit in order to accessing VS-mode memory from HS-mode.

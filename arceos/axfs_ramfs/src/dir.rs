@@ -165,6 +165,49 @@ impl VfsNodeOps for DirNode {
         }
     }
 
+    fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
+        let src_path = src_path.trim_start_matches('/');
+        let dst_path = dst_path.trim_start_matches('/');
+
+        let (src_parent, src_name) = src_path.rsplit_once('/').unwrap_or(("", src_path));
+        let (dst_parent, dst_name) = dst_path.rsplit_once('/').unwrap_or(("", dst_path));
+
+        if src_parent != dst_parent {
+            return Err(VfsError::Unsupported);
+        }
+        if src_name.is_empty()
+            || dst_name.is_empty()
+            || matches!(src_name, "." | "..")
+            || matches!(dst_name, "." | "..")
+        {
+            return Err(VfsError::InvalidInput);
+        }
+
+        if !src_parent.is_empty() {
+            let parent = self
+                .this
+                .upgrade()
+                .ok_or(VfsError::NotFound)?
+                .lookup(src_parent)?;
+            return parent.rename(src_name, dst_name);
+        }
+
+        let mut children = self.children.write();
+        if src_name == dst_name {
+            return children
+                .contains_key(src_name)
+                .then_some(())
+                .ok_or(VfsError::NotFound);
+        }
+        if children.contains_key(dst_name) {
+            return Err(VfsError::AlreadyExists);
+        }
+
+        let node = children.remove(src_name).ok_or(VfsError::NotFound)?;
+        children.insert(dst_name.into(), node);
+        Ok(())
+    }
+
     axfs_vfs::impl_vfs_dir_default! {}
 }
 

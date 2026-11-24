@@ -137,7 +137,18 @@ impl VfsNodeOps for RootDirectory {
             if rest_path.is_empty() {
                 ax_err!(PermissionDenied) // cannot rename mount points
             } else {
-                fs.root_dir().rename(rest_path, dst_path)
+                // `rest_path` is relative to the mounted filesystem, so the
+                // destination must be converted to the same namespace.
+                let Some(mount_prefix) = src_path.strip_suffix(rest_path) else {
+                    return ax_err!(InvalidInput);
+                };
+                let Some(dst_relative) = dst_path.strip_prefix(mount_prefix) else {
+                    return ax_err!(Unsupported);
+                };
+                if !mount_prefix.is_empty() && !dst_relative.starts_with('/') {
+                    return ax_err!(Unsupported);
+                }
+                fs.root_dir().rename(rest_path, dst_relative)
             }
         })
     }

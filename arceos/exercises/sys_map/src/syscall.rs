@@ -1,13 +1,13 @@
 #![allow(dead_code)]
 
-use core::ffi::{c_void, c_char, c_int};
-use axhal::arch::TrapFrame;
-use axhal::trap::{register_trap_handler, SYSCALL};
+use arceos_posix_api as api;
 use axerrno::LinuxError;
+use axhal::arch::TrapFrame;
+use axhal::paging::MappingFlags;
+use axhal::trap::{register_trap_handler, SYSCALL};
 use axtask::current;
 use axtask::TaskExtRef;
-use axhal::paging::MappingFlags;
-use arceos_posix_api as api;
+use core::ffi::{c_char, c_int, c_void};
 
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -100,9 +100,14 @@ bitflags::bitflags! {
 fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ax_println!("handle_syscall [{}] ...", syscall_num);
     let ret = match syscall_num {
-         SYS_IOCTL => sys_ioctl(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _,
+        SYS_IOCTL => sys_ioctl(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _,
         SYS_SET_TID_ADDRESS => sys_set_tid_address(tf.arg0() as _),
-        SYS_OPENAT => sys_openat(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _, tf.arg3() as _),
+        SYS_OPENAT => sys_openat(
+            tf.arg0() as _,
+            tf.arg1() as _,
+            tf.arg2() as _,
+            tf.arg3() as _,
+        ),
         SYS_CLOSE => sys_close(tf.arg0() as _),
         SYS_READ => sys_read(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _),
         SYS_WRITE => sys_write(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _),
@@ -110,11 +115,11 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         SYS_EXIT_GROUP => {
             ax_println!("[SYS_EXIT_GROUP]: system is exiting ..");
             axtask::exit(tf.arg0() as _)
-        },
+        }
         SYS_EXIT => {
             ax_println!("[SYS_EXIT]: system is exiting ..");
             axtask::exit(tf.arg0() as _)
-        },
+        }
         SYS_MMAP => sys_mmap(
             tf.arg0() as _,
             tf.arg1() as _,
@@ -140,7 +145,68 @@ fn sys_mmap(
     fd: i32,
     _offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    use memory_addr::VirtAddrRange;
+
+    const PAGE_SIZE: usize = 4096;
+
+    let mmap_flags = MmapFlags::from_bits_truncate(flags);
+    if length == 0
+        || !addr.is_null()
+        || _offset != 0
+        || fd < 0
+        || !mmap_flags.contains(MmapFlags::MAP_PRIVATE)
+        || mmap_flags.contains(MmapFlags::MAP_ANONYMOUS)
+    {
+        return -(LinuxError::EINVAL.code() as isize);
+    }
+
+    let map_size = match length.checked_add(PAGE_SIZE - 1) {
+        Some(size) => size & !(PAGE_SIZE - 1),
+        None => return -(LinuxError::ENOMEM.code() as isize),
+    };
+
+    // Read through the file descriptor before locking the user address space.
+    // Bytes after EOF remain zero-filled in the populated mapping.
+    let mut data = alloc::vec![0u8; length];
+    let mut read_total = 0;
+    while read_total < length {
+        let n = api::sys_read(
+            fd,
+            data[read_total..].as_mut_ptr() as *mut c_void,
+            length - read_total,
+        );
+        if n < 0 {
+            return n;
+        }
+        if n == 0 {
+            break;
+        }
+        read_total += n as usize;
+    }
+
+    let task = current();
+    let mut aspace = task.task_ext().aspace.lock();
+    let base = aspace.base();
+    let limit = VirtAddrRange::from_start_size(base, aspace.size());
+    let start = match aspace.find_free_area(base, map_size, limit) {
+        Some(vaddr) => vaddr,
+        None => return -(LinuxError::ENOMEM.code() as isize),
+    };
+
+    let mapping_flags = MappingFlags::from(MmapProt::from_bits_truncate(prot));
+    if aspace
+        .map_alloc(start, map_size, mapping_flags, true)
+        .is_err()
+    {
+        return -(LinuxError::ENOMEM.code() as isize);
+    }
+
+    if read_total != 0 && aspace.write(start, &data[..read_total]).is_err() {
+        let _ = aspace.unmap(start, map_size);
+        return -(LinuxError::EFAULT.code() as isize);
+    }
+
+    start.as_usize() as isize
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {
